@@ -664,7 +664,7 @@ class GPUModelRunner(
                     )
             elif self.speculative_config.method == "extract_hidden_states":
                 self.drafter = ExtractHiddenStatesProposer(
-                    vllm_config=self.vllm_config, device=self.device
+                    vllm_config=self.vllm_config, device=self.device, runner=self
                 )
                 self.use_aux_hidden_state_outputs = True
             else:

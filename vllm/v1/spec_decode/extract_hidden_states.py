@@ -10,6 +10,7 @@ import torch.nn as nn
 
 from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.distributed.eplb.eplb_state import EplbState
+from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
@@ -26,7 +27,7 @@ PADDING_SLOT_ID = -1
 
 
 class ExtractHiddenStatesProposer:
-    def __init__(self, vllm_config: VllmConfig, device):
+    def __init__(self, vllm_config: VllmConfig, device, runner=None):
         assert vllm_config.speculative_config is not None
 
         self.num_speculative_tokens = (
@@ -42,6 +43,20 @@ class ExtractHiddenStatesProposer:
         self.device = device
         self.dtype = vllm_config.model_config.dtype
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        # Model runner owning this drafter; used to resolve per-request state
+        # when hidden states are streamed to CPU pages.
+        self.runner = runner
+        # With hs_store_device=cpu the cache-only layer stays out of the
+        # device KV pool and hidden states are streamed to per-request CPU
+        # pages via the KV connector's save_hs_batch.
+        kv_transfer_config = vllm_config.kv_transfer_config
+        self._hs_store_cpu = (
+            kv_transfer_config is not None
+            and str(
+                kv_transfer_config.get_from_extra_config("hs_store_device", "device")
+            ).lower()
+            == "cpu"
+        )
 
         self.eplb_state: EplbState | None = None
 
@@ -131,6 +146,41 @@ class ExtractHiddenStatesProposer:
 
         # Copy hidden states to buffer
         self.hidden_states[:num_tokens] = stacked_hidden_states
+
+        if self._hs_store_cpu:
+            # Hidden states are kept off the device KV pool: stream this
+            # step's tokens to per-request CPU pages via the connector and
+            # skip the cache-only device write (there is no
+            # HiddenStateCacheSpec group). Every guard below fails loudly:
+            # silently skipping a streaming step would leave zero rows in
+            # the saved hidden states.
+            if not has_kv_transfer_group():
+                raise ValueError(
+                    "hs_store_device=cpu requires an active KV transfer "
+                    "group to stream hidden states to CPU pages"
+                )
+            connector = get_kv_transfer_group()
+            save_fn = getattr(connector, "save_hs_batch", None)
+            if save_fn is None:
+                raise ValueError(
+                    "hs_store_device=cpu requires a KV connector that "
+                    "implements save_hs_batch (e.g. "
+                    f"ExampleHiddenStatesConnector), got "
+                    f"{type(connector).__name__}"
+                )
+            if self.runner is None:
+                raise ValueError(
+                    "hs_store_device=cpu requires the drafter to hold a "
+                    "model runner reference to resolve per-request ids"
+                )
+            num_reqs = int(common_attn_metadata.num_reqs)
+            save_fn(
+                self.hidden_states[:num_tokens],
+                common_attn_metadata,
+                list(self.runner.input_batch.req_ids[:num_reqs]),
+                getattr(self.runner, "requests", None),
+            )
+            return sampled_token_ids[:, :1]
 
         assert self.attn_metadata_builder is not None
         attn_metadata = self.attn_metadata_builder.build_for_drafting(
@@ -403,4 +453,10 @@ class ExtractHiddenStatesProposer:
             if layer in group.layer_names:
                 self.kv_cache_gid = gid
                 return
+        if self._hs_store_cpu and kv_cache_config.kv_cache_groups:
+            # The cache-only layer is kept off the device KV pool; reuse
+            # group 0's common_attn_metadata (query_start_loc /
+            # num_computed_tokens are batch-global).
+            self.kv_cache_gid = 0
+            return
         raise ValueError(f"Cache-only layer {layer!r} not in any KV cache group")
