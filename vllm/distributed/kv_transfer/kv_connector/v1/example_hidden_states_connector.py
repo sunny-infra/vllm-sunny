@@ -673,6 +673,59 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             requests,
         )
 
+    def save_hs_batch_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        req_ids: list[str] | None,
+        query_start_loc_cpu: Any,
+        seq_lens: Any,
+        num_actual_tokens: int,
+        requests: dict[str, Any] | None = None,
+    ) -> None:
+        """``save_hs_batch`` variant for runners without CommonAttentionMetadata.
+
+        The V2 GPU model runner batches requests with its own ``InputBatch``
+        (per-batch ``req_ids`` / ``query_start_loc`` / ``seq_lens``), so the
+        per-request bookkeeping is passed explicitly instead of through
+        attention metadata. Semantics match ``save_hs_batch`` exactly: the
+        write offset prefers host-side ``num_computed_tokens`` from the
+        request states and falls back to deriving it from ``seq_lens``.
+        """
+        if not self._hs_store_cpu:
+            return
+        if not self._is_tp_rank_zero:
+            return
+        if req_ids is None or hidden_states.numel() == 0:
+            return
+
+        num_reqs = len(req_ids)
+        if num_reqs <= 0:
+            return
+
+        qsl = query_start_loc_cpu
+        if getattr(qsl, "is_cuda", False):
+            qsl = qsl.cpu()
+        qsl_list = qsl[: num_reqs + 1].tolist()
+
+        nct_list = self._host_num_computed_tokens(req_ids, requests, num_reqs)
+        if nct_list is None:
+            seq = seq_lens
+            if getattr(seq, "is_cuda", False):
+                seq = seq.cpu()
+            seq_list = seq[:num_reqs].tolist()
+            nct_list = [
+                int(seq_list[i]) - int(qsl_list[i + 1] - qsl_list[i])
+                for i in range(num_reqs)
+            ]
+        self._save_hs_to_pages(
+            hidden_states,
+            int(num_actual_tokens),
+            qsl_list,
+            nct_list,
+            req_ids,
+            requests,
+        )
+
     @staticmethod
     def _host_num_computed_tokens(
         req_ids: list[str],
