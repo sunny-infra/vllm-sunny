@@ -67,6 +67,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.reload.inplace import reload_weights
+from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionLayer
 from vllm.model_executor.models.interfaces import (
     MixtureOfExperts,
     MultiModalEmbeddings,
@@ -182,7 +183,10 @@ from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+from vllm.v1.spec_decode.extract_hidden_states import (
+    ExtractHiddenStatesProposer,
+    is_hs_store_cpu,
+)
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
@@ -7197,6 +7201,16 @@ class GPUModelRunner(
                 # a given amount of memory to accommodate longer context lengths
                 # or enable more requests to be processed simultaneously.
                 self.shared_kv_cache_layers[layer_name] = kv_tgt_layer
+                continue
+            if isinstance(attn_module, CacheOnlyAttentionLayer) and is_hs_store_cpu(
+                self.vllm_config
+            ):
+                # With hs_store_device=cpu the hidden states are streamed to
+                # per-request CPU pages via the connector's save_hs_batch;
+                # the cache-only layer stays out of the device KV pool
+                # entirely (no spec, no group, no allocation). Mirrors the
+                # kv-sharing skip above: KV cache management acts as if this
+                # layer does not exist.
                 continue
             # Skip modules that don't need KV cache (eg encoder-only attention)
             if spec := attn_module.get_kv_cache_spec(self.vllm_config):

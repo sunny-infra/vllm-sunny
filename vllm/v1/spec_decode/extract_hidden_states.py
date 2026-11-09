@@ -26,6 +26,24 @@ if TYPE_CHECKING:
 PADDING_SLOT_ID = -1
 
 
+def is_hs_store_cpu(vllm_config: VllmConfig) -> bool:
+    """Whether extract_hidden_states hidden states are stored on CPU.
+
+    Single source of truth for the ``hs_store_device`` extra-config key
+    (default ``device``), read by the connector, this proposer, and the
+    platform model runners' kv-cache spec generation (which must skip the
+    cache-only layer's spec so the device pool is never allocated).
+    """
+    kv_transfer_config = vllm_config.kv_transfer_config
+    return (
+        kv_transfer_config is not None
+        and str(
+            kv_transfer_config.get_from_extra_config("hs_store_device", "device")
+        ).lower()
+        == "cpu"
+    )
+
+
 class ExtractHiddenStatesProposer:
     def __init__(self, vllm_config: VllmConfig, device, runner=None):
         assert vllm_config.speculative_config is not None
@@ -49,14 +67,7 @@ class ExtractHiddenStatesProposer:
         # With hs_store_device=cpu the cache-only layer stays out of the
         # device KV pool and hidden states are streamed to per-request CPU
         # pages via the KV connector's save_hs_batch.
-        kv_transfer_config = vllm_config.kv_transfer_config
-        self._hs_store_cpu = (
-            kv_transfer_config is not None
-            and str(
-                kv_transfer_config.get_from_extra_config("hs_store_device", "device")
-            ).lower()
-            == "cpu"
-        )
+        self._hs_store_cpu = is_hs_store_cpu(vllm_config)
 
         self.eplb_state: EplbState | None = None
 

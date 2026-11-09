@@ -185,14 +185,9 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         # With hs_store_device=cpu there is no device HiddenStateCacheSpec
         # group: the proposer streams hidden states to per-request CPU pages
         # via save_hs_batch instead.
-        self._hs_store_cpu = (
-            str(
-                self._kv_transfer_config.get_from_extra_config(
-                    "hs_store_device", "device"
-                )
-            ).lower()
-            == "cpu"
-        )
+        from vllm.v1.spec_decode.extract_hidden_states import is_hs_store_cpu
+
+        self._hs_store_cpu = is_hs_store_cpu(self._vllm_config)
         if self._hs_store_cpu:
             self._cache_kv_group_id = 0
             self._block_size = vllm_config.cache_config.block_size
