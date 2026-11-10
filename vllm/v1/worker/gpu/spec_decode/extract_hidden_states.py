@@ -8,6 +8,7 @@ import torch.nn as nn
 from vllm.compilation.backends import set_model_tag
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.kv_transfer import is_hs_store_cpu
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.utils import get_draft_load_config
@@ -39,6 +40,11 @@ class ExtractHiddenStatesSpeculator(DraftModelSpeculator):
             )
 
         self.supports_mm_inputs = False
+        # True when the KV connector streams hidden states to per-request
+        # CPU pages (hs_store_device=cpu). This speculator has no
+        # CPU-page streaming path; `propose` fails loudly in that case
+        # instead of silently producing empty saved files.
+        self._hs_store_cpu = is_hs_store_cpu(vllm_config)
         layer_ids = getattr(
             self.draft_model_config.hf_config,
             "eagle_aux_hidden_state_layer_ids",
@@ -119,10 +125,25 @@ class ExtractHiddenStatesSpeculator(DraftModelSpeculator):
             seeds,
             dummy_run,
             mm_inputs,
-            is_profile,
         )
 
         draft_tokens = last_sampled[input_batch.idx_mapping, :1]
+        if self._hs_store_cpu and not is_profile:
+            # With hs_store_device=cpu the connector's get_finished takes
+            # the CPU-pages path and never gathers from the device KV
+            # cache, so a speculator that only writes to the device pool
+            # would silently produce empty saved files. Fail loudly
+            # instead (mirrors the V1 proposer's guards). The profiling
+            # step is exempt: it runs before the KV transfer group is
+            # created and its outputs are discarded anyway.
+            raise ValueError(
+                "hs_store_device=cpu is not supported by the extract_"
+                "hidden_states V2 model runner: this speculator has no "
+                "CPU-page streaming path, so hidden states would be "
+                "silently lost. Use the V1 model runner or drop "
+                "hs_store_device=cpu to store hidden states in the "
+                "device KV cache."
+            )
         if skip_attn_for_dummy_run:
             return draft_tokens
         if aux_hidden_states is None:

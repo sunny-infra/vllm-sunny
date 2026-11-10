@@ -14,6 +14,7 @@ from packaging.version import Version
 from safetensors.torch import load_file, save_file
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.config.kv_transfer import is_hs_store_cpu
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
@@ -185,8 +186,6 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         # With hs_store_device=cpu there is no device HiddenStateCacheSpec
         # group: the proposer streams hidden states to per-request CPU pages
         # via save_hs_batch instead.
-        from vllm.v1.spec_decode.extract_hidden_states import is_hs_store_cpu
-
         self._hs_store_cpu = is_hs_store_cpu(self._vllm_config)
         if self._hs_store_cpu:
             self._cache_kv_group_id = 0
@@ -604,6 +603,12 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             hi = lo + bs
             if page.shape[0] < hi:
                 break
+            if page.is_floating_point() and bool(page[lo:hi].isnan().any()):
+                # Partially-filled block: prefix-hit rows the index could
+                # not backfill keep the NaN sentinel. Publishing it would
+                # spread those holes to every future request that hits
+                # the same hash.
+                continue
             self._hs_hash_blocks[h] = page[lo:hi].contiguous().clone()
             self._hs_hash_tokens += bs
         self._evict_hs_hash_blocks()
@@ -622,7 +627,8 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         concatenates. Rows skipped by an engine prefix-cache hit are backfilled
         from the CPU prefix index when possible (see _fill_prefix_from_hash);
         rows that cannot be proven (multimodal / prompt-embeds requests) or
-        were evicted stay unfilled and a warning is logged.
+        were evicted stay NaN-filled (a sentinel the writer thread audits, so
+        holes are detectable downstream instead of looking like valid data).
         """
         if not self._hs_store_cpu:
             return
@@ -642,21 +648,76 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             qsl = qsl.cpu()
         qsl_list = qsl[: num_reqs + 1].tolist()
 
-        seq_lens = common_attn_metadata.seq_lens[:num_reqs]
-        if getattr(seq_lens, "is_cuda", False):
-            seq_lens = seq_lens.cpu()
-        seq_list = seq_lens.tolist()
-        # num_computed_tokens = seq_len - query_len: the logical write offset
-        # of this step's rows in the request's page.
-        nct_list = [
-            int(seq_list[i]) - int(qsl_list[i + 1] - qsl_list[i])
-            for i in range(num_reqs)
-        ]
-
-        num_actual = min(
+        # num_computed_tokens per request is the page's logical write
+        # offset. Prefer the scheduler-fed host value
+        # (req_state.num_computed_tokens, updated right before forward):
+        # it equals seq_lens - query_len without pulling the device
+        # seq_lens tensor to host on every step. Fall back to deriving
+        # it from seq_lens only when request state is unavailable.
+        nct_list = self._host_num_computed_tokens(req_ids, requests, num_reqs)
+        if nct_list is None:
+            seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+            if getattr(seq_lens, "is_cuda", False):
+                seq_lens = seq_lens.cpu()
+            seq_list = seq_lens.tolist()
+            nct_list = [
+                int(seq_list[i]) - int(qsl_list[i + 1] - qsl_list[i])
+                for i in range(num_reqs)
+            ]
+        self._save_hs_to_pages(
+            hidden_states,
             int(common_attn_metadata.num_actual_tokens),
-            int(hidden_states.shape[0]),
+            qsl_list,
+            nct_list,
+            req_ids,
+            requests,
         )
+
+    @staticmethod
+    def _host_num_computed_tokens(
+        req_ids: list[str],
+        requests: dict[str, Any] | None,
+        num_reqs: int,
+    ) -> list[int] | None:
+        """Per-request num_computed_tokens from the host request states.
+
+        Returns None when any request lacks state (or requests is None),
+        so the caller falls back to deriving the offsets from the device
+        seq_lens.
+        """
+        if requests is None:
+            return None
+        nct_list: list[int] = []
+        for i in range(num_reqs):
+            st = requests.get(req_ids[i]) if i < len(req_ids) else None
+            nct = getattr(st, "num_computed_tokens", None)
+            if nct is None:
+                return None
+            nct_list.append(int(nct))
+        return nct_list
+
+    def _save_hs_to_pages(
+        self,
+        hidden_states: torch.Tensor,
+        num_actual_tokens: int,
+        qsl_list: list[int],
+        nct_list: list[int],
+        req_ids: list[str],
+        requests: dict[str, Any] | None,
+    ) -> None:
+        """Splice this step's rows into per-request CPU pages.
+
+        ``nct_list[i]`` is request i's num_computed_tokens (its logical
+        write offset), so chunked prefill concatenates. Rows skipped by
+        an engine prefix-cache hit are backfilled from the CPU prefix
+        index when possible (see _fill_prefix_from_hash); rows that cannot
+        be proven (multimodal / prompt-embeds requests) or were evicted
+        stay NaN-filled (a sentinel the writer thread audits, so holes are
+        detectable downstream instead of looking like valid data).
+        """
+        num_reqs = len(req_ids)
+
+        num_actual = min(int(num_actual_tokens), int(hidden_states.shape[0]))
         hs = hidden_states[:num_actual]
         if hs.numel() == 0:
             return
@@ -682,41 +743,46 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             )
             self._logged_cpu_pages = True
 
-        copy_stream = self._get_copy_stream()
-        ready_event = torch.cuda.Event()
-        ready_event.record()
-        copy_stream.wait_event(ready_event)
+        if hs.is_cuda:
+            copy_stream = self._get_copy_stream()
+            ready_event = torch.cuda.Event()
+            ready_event.record()
+            copy_stream.wait_event(ready_event)
 
-        staging = self._hs_staging
-        if (
-            staging is None
-            or staging.shape[0] < num_actual
-            or staging.dtype != dtype
-            or staging.shape[1] != num_layers
-            or staging.shape[2] != hidden_size
-        ):
-            try:
-                staging = torch.empty(
-                    (num_actual, num_layers, hidden_size),
-                    dtype=dtype,
-                    device="cpu",
-                    pin_memory=True,
-                )
-            except Exception:
-                staging = torch.empty(
-                    (num_actual, num_layers, hidden_size),
-                    dtype=dtype,
-                    device="cpu",
-                )
-            self._hs_staging = staging
+            staging = self._hs_staging
+            if (
+                staging is None
+                or staging.shape[0] < num_actual
+                or staging.dtype != dtype
+                or staging.shape[1] != num_layers
+                or staging.shape[2] != hidden_size
+            ):
+                try:
+                    staging = torch.empty(
+                        (num_actual, num_layers, hidden_size),
+                        dtype=dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                except Exception:
+                    staging = torch.empty(
+                        (num_actual, num_layers, hidden_size),
+                        dtype=dtype,
+                        device="cpu",
+                    )
+                self._hs_staging = staging
 
-        with torch.cuda.stream(copy_stream):
-            for start in range(0, num_actual, chunk):
-                end = min(start + chunk, num_actual)
-                staging[start:end].copy_(hs[start:end], non_blocking=True)
-                chunk_done = torch.cuda.Event()
-                chunk_done.record(copy_stream)
-                chunk_done.synchronize()
+            with torch.cuda.stream(copy_stream):
+                for start in range(0, num_actual, chunk):
+                    end = min(start + chunk, num_actual)
+                    staging[start:end].copy_(hs[start:end], non_blocking=True)
+                    chunk_done = torch.cuda.Event()
+                    chunk_done.record(copy_stream)
+                    chunk_done.synchronize()
+        else:
+            # Host-side hidden states (CPU-only platforms, unit tests): no
+            # copy stream or pinned staging needed, stream from the tensor.
+            staging = hs
 
         for i in range(num_reqs):
             q0 = int(qsl_list[i])
@@ -749,6 +815,13 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                         dtype=dtype,
                         device="cpu",
                     )
+                # Sentinel-fill: rows the engine skipped (prefix-cache hits
+                # the CPU index cannot prove) or the growth gap of a dropped
+                # streaming step would otherwise keep uninitialized memory
+                # that looks like plausible data in the saved file. NaN is
+                # detectable downstream (isfinite) and audited on save.
+                if new_page.is_floating_point():
+                    new_page.fill_(float("nan"))
                 if page is not None:
                     new_page[: page.shape[0]].copy_(page)
                 self._cpu_pages[req_id] = new_page
@@ -766,15 +839,40 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         event: torch.cuda.Event,
         filename: str,
         lock_fd: int | None,
+        req_id: str | None = None,
+        audit_nan: bool = False,
     ) -> None:
         """Thread worker: wait for async DtoH copy, write to disk, release lock.
 
         ``lock_fd`` is an open file descriptor on the companion ``.lock``
         file with ``LOCK_EX`` already held.  Closing it releases the lock,
         which unblocks any client sleeping on ``LOCK_SH``.
+
+        With ``audit_nan`` (CPU-pages path), count rows still holding the
+        NaN sentinel before writing: they were never filled (prefix-cache
+        rows the index could not prove, or a dropped streaming step) and the
+        log makes the hole auditable instead of looking like valid data.
         """
         try:
             event.synchronize()
+            if audit_nan:
+                hs = tensors["hidden_states"]
+                if hs.is_floating_point():
+                    hole_rows = int(
+                        torch.isnan(hs)
+                        .any(dim=tuple(range(1, hs.dim())))
+                        .sum()
+                    )
+                    if hole_rows:
+                        logger.warning(
+                            "req_id=%s: %s/%s hidden-state rows were never "
+                            "filled (NaN sentinel); prefix-cache rows missed "
+                            "by the CPU index or a dropped streaming step - "
+                            "treat those rows as invalid",
+                            req_id,
+                            hole_rows,
+                            hs.shape[0],
+                        )
             save_file(tensors, filename)
         finally:
             if lock_fd is not None:
@@ -811,27 +909,15 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                 self._cpu_pages.pop(pending.req_id, None)
                 self._req_block_hashes.pop(pending.req_id, None)
                 return
-            page = self._cpu_pages.pop(pending.req_id, None)
-            self._req_block_hashes.pop(pending.req_id, None)
-            num_tokens = int(pending.token_ids.shape[0])
-            if page is None:
-                logger.error("No CPU hidden states for req_id=%s", pending.req_id)
+            finalized = self._finalize_cpu_page(pending.req_id, pending.token_ids)
+            if finalized is None:
                 return
-            if page.shape[0] < num_tokens:
-                logger.error(
-                    "CPU hidden-states page too short for req_id=%s: %s < %s",
-                    pending.req_id,
-                    page.shape[0],
-                    num_tokens,
-                )
-                num_tokens = int(page.shape[0])
-            hidden_states_cpu = page[:num_tokens].contiguous().clone()
-            del page
+            hidden_states_cpu, token_ids = finalized
             copy_done = torch.cuda.Event()
             copy_done.record()
             tensors = {
                 "hidden_states": hidden_states_cpu,
-                "token_ids": pending.token_ids.clone(),
+                "token_ids": token_ids,
             }
             os.makedirs(os.path.dirname(pending.filename) or ".", exist_ok=True)
             lock_fd = self._lock_fds.pop(pending.req_id, None)
@@ -842,7 +928,13 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
             future = self._executor.submit(
-                self._write_tensors, tensors, copy_done, pending.filename, lock_fd
+                self._write_tensors,
+                tensors,
+                copy_done,
+                pending.filename,
+                lock_fd,
+                pending.req_id,
+                self._hs_store_cpu,
             )
             self._req_copy_events[pending.req_id] = copy_done
             self._req_futures[pending.req_id] = future
@@ -921,6 +1013,41 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self._req_copy_events[pending.req_id] = copy_done
         self._req_futures[pending.req_id] = future
         future.add_done_callback(partial(self._on_write_done, pending.req_id))
+
+    def _finalize_cpu_page(
+        self, req_id: str, token_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Pop a finished request's CPU page and align it with its token ids.
+
+        Returns ``(hidden_states, token_ids)`` trimmed to the same length, or
+        ``None`` if nothing was ever streamed for the request. Unfilled rows
+        keep their NaN sentinel (audited by the writer thread) instead of
+        leaking stale memory into the saved file.
+        """
+        page = self._cpu_pages.pop(req_id, None)
+        self._req_block_hashes.pop(req_id, None)
+        if page is None:
+            logger.error("No CPU hidden states for req_id=%s", req_id)
+            return None
+        num_tokens = int(token_ids.shape[0])
+        if page.shape[0] < num_tokens:
+            # A streaming step was dropped (the proposers raise on that
+            # condition, but stay defensive): keep both tensors the same
+            # length so row i still corresponds to token i. The saved file
+            # is then a valid prefix of the sequence, and the loss is loud.
+            logger.error(
+                "CPU hidden-states page too short for req_id=%s: %s < %s; "
+                "saving the first %s tokens only",
+                req_id,
+                page.shape[0],
+                num_tokens,
+                page.shape[0],
+            )
+            num_tokens = int(page.shape[0])
+            token_ids = token_ids[:num_tokens]
+        # The page is popped (sole owner), so hand the view to the writer
+        # thread without another full-size clone.
+        return page[:num_tokens].contiguous(), token_ids
 
     # ==============================
     # Scheduler-side methods
@@ -1095,6 +1222,13 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             if lock_fd is not None:
                 os.close(lock_fd)
 
+        if self._hs_store_cpu:
+            # request_finished returns delay_free=False in CPU-pages mode, so
+            # the scheduler already freed the request and dropped its id before
+            # this poll runs; reporting it as finished_sending would trip the
+            # scheduler's "req_id in self.requests" assertion. There are no
+            # device blocks to release, so stay silent on the KV-xfer channel.
+            return None, None
         return done_sending or None, None
 
     def request_finished_all_groups(

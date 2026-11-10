@@ -129,4 +129,4 @@ Each request produces a `.safetensors` file containing:
 The file path is returned in `output.kv_transfer_params["hidden_states_path"]`. Use `load_hidden_states()` from the connector module to read the file with proper synchronization.
 
 !!! note
-    Chunked prefill is not compatible with this feature and must be disabled.
+    Chunked prefill is supported in both storage modes. With `hs_store_device=device`, hidden states are gathered from the finished request's KV cache blocks, which accumulate across chunks. With `hs_store_device=cpu`, each step's rows are appended to the request's CPU page at that step's `num_computed_tokens` offset, so a prompt split across multiple prefill steps is reassembled in order. An earlier version of this feature required disabling chunked prefill; that restriction no longer applies.

@@ -37,6 +37,7 @@ from vllm.config import (
 )
 from vllm.config.cache import CacheConfig
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
+from vllm.config.kv_transfer import is_hs_store_cpu
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
@@ -185,7 +186,6 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import (
     ExtractHiddenStatesProposer,
-    is_hs_store_cpu,
 )
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata

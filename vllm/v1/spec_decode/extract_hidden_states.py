@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+from vllm.config.kv_transfer import is_hs_store_cpu
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.forward_context import set_forward_context
@@ -24,24 +25,6 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 PADDING_SLOT_ID = -1
-
-
-def is_hs_store_cpu(vllm_config: VllmConfig) -> bool:
-    """Whether extract_hidden_states hidden states are stored on CPU.
-
-    Single source of truth for the ``hs_store_device`` extra-config key
-    (default ``device``), read by the connector, this proposer, and the
-    platform model runners' kv-cache spec generation (which must skip the
-    cache-only layer's spec so the device pool is never allocated).
-    """
-    kv_transfer_config = vllm_config.kv_transfer_config
-    return (
-        kv_transfer_config is not None
-        and str(
-            kv_transfer_config.get_from_extra_config("hs_store_device", "device")
-        ).lower()
-        == "cpu"
-    )
 
 
 class ExtractHiddenStatesProposer:
